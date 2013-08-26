@@ -1,0 +1,81 @@
+WBKFS
+=====
+
+Weller BacKup File System
+
+=====
+
+1) Sistema de arquivos com backup integrado (wbkfs)
+
+	Funcionalidade: Realização de backup dos arquivos, antes deles serem efetivamente alterados.
+	Ao gravar algum arquivo, o "wbkfs" armazena o conteúdo original em um arquivo de backup (extensão BKP).
+	(Ex.: Ao salvar o arquivo "anderson.txt" é gerado um outro "anderson.txt.BKP" com o conteúdo anterior do arquivo)
+
+2) Origem do "wbkfs":
+
+	- Surgiu a partir de alterações no "islenefs" em conjunto com o "lwnfs".
+
+3) Modificações nos diretórios/arquivos de fonte do kernel, para a inclusão do novo sistema de arquivos:
+
+	- Mudando para o diretório inicial do código fonte do kernel, por exemplo:
+		cd /home/anderson/linux-3.10.6/
+
+	- Criação de diretório:
+		mkdir -p ./fs/wbkfs
+
+	- Criação do Makefile (nesse diretório) com o conteúdo (obj-y += wbkfs.o):
+		echo "obj-y += wbkfs.o" > ./fs/wbkfs/Makefile
+
+	- Alteração do Makefile do diretório ../fs, incluindo linha para o novo diretório (obj-y += wbkfs/):
+		cp ./fs/Makefile ./fs/Makefile.old
+		echo "obj-y += wbkfs/" >> ./fs/Makefile
+
+3) Compilação do Kernel:
+
+	- Continuando no diretório inicial do código fonte do kernel, por exemplo:
+		cd /home/anderson/linux-3.10.6/
+
+	- Compilar o kernel do linux (Calculando o tempo (time) e gerando arquivos ".deb" para instalação do kernel com o "dpkg -i ...")
+		time fakeroot make-kpkg -j1 --initrd --revision=3.10.6 --append-to-version=wbkfs.01 kernel_image kernel_headers
+
+4) Testar o funcionamento do novo FileSystem
+
+	- Abrir o QEMU com o novo Kernel (Exemplo utilizando a imagem "../mo806.img")
+		qemu-system-i386 -hda ../mo806.img -kernel arch/i386/boot/bzImage -append "ro root=/dev/hda"
+
+	- Criar um novo disco virtual (para utilizar com o wbkfs)
+		dd if=/dev/zero of=virtual.dsk bs=1k count=40
+
+	- Montar o disco virtual
+		mkdir mnt
+		mount -t wbkfs -o loop virtual.dsk mnt/
+
+	- Acessar o diretório montado
+		cd mnt
+
+	- Realizar os testes:
+		cat > a.txt
+		[... digitar texto ...]
+		[... Pressionar CTRL+D para encerrar o "cat" ...]
+
+	- Verificar o resultado dos testes (digitar os comandos e verificar os resultados):
+		ls -la
+		cat a.txt
+		cat a.txt.BKP
+
+	- Desmontar a unidade de testes:
+		cd ..
+		umount mnt
+
+	- Fechar o QEMU
+		shutdown -h now
+
+5) Principais Métodos:
+
+    static struct file_contents *wbkfs_find_file(struct inode *inode);
+    ssize_t wbkfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
+    ssize_t wbkfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos);
+    static struct inode *wbkfs_make_inode(struct super_block *sb, int mode);
+    static int wbkfs_create (struct inode *dir, struct dentry * dentry, umode_t mode, bool excl);
+    static struct dentry *wbkfs_create_file (struct super_block *sb, struct dentry *dir, const char *name);
+
