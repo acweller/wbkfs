@@ -1,14 +1,18 @@
 /*
- * wbkfs: sistema de arquivos de brinquedo para utilização em sala de aula.
- * Versão original escrita por Glauber de Oliveira Costa para a disciplina MC514
- * (Sistemas Operacionais: teoria e prática) no primeiro semestre de 2008.
- * Código atualizado para rodar com kernel 3.10.x.
- *
- * Alteração:   Anderson Coelho Weller
- * Data:        Agosto / 2013
- * Modificação: Inclusão de backup dos arquivos gravados.
+ * WBkFS: Sistema de arquivos de brinquedo que realiza backup dos arquivos gravados.
+ *    Baseado nos sistemas de arquivos: LwnFS, IsleneFS e GOGIsleneFS.
  * 
+ * Obs.: Código atualizado para rodar com kernel 3.10.x.
+ *
+ * Detalhes da implementação:
+ * - inode->i_private - Armazena o conteúdo do arquivo.
+ * - inode->i_size    - Armazena o número de bytes gravados no arquivo.
+ *                      Obs.: Por algum motivo (???) no método Write o valor aparece zerado.
+ *
+ * Autor: Anderson Coelho Weller
+ * Data : 2º Semestre 2013
  */
+
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/errno.h>
@@ -18,348 +22,374 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
-
 #include <asm/current.h>
 #include <asm/uaccess.h>
 
 
-/* O wbkfs eh um fs muito simples. Os inodes sao atribuidos em ordem crescente, sem
- * reaproveitamento */
+// Os inodes sao atribuidos em ordem crescente, sem reaproveitamento
 static int inode_number = 0;
 
-/* Lembre-se que nao temos um disco! (Isso so complicaria as coisas, pois teriamos
- * que lidar com o sub-sistema de I/O. Entao teremos uma representacao bastante
- * simples da estrutura de arquivos: Uma lista duplamente ligada circular (para
- * aplicacoes reais, um hash seria muito mais adequado) contem em cada elemento
- * um indice (inode) e uma pagina para conteudo (ou seja: o tamanho maximo de um
- * arquivo nessa versao do anderson bkfs eh de 4Kb. Nao ha subdiretorios */
-struct file_contents {
-	struct list_head list;
-	struct inode *inode;
-	void *conts;
-};
 
-/* lista duplamente ligada circular, contendo todos os arquivos do fs */
-static LIST_HEAD(contents_list);
+// Protótipos das funções.
+struct inode *wbkfs_find_bkp(struct file *file, const char *name);
+static struct inode *wbkfs_create_backup(struct super_block *sb, struct dentry *dir, const char *name);
+static struct inode *wbkfs_make_inode(struct super_block *sb, int mode);
+
 
 static const struct super_operations wbkfs_ops = {
-        .statfs         = simple_statfs,
-        .drop_inode     = generic_delete_inode,
+        .statfs		= simple_statfs,
+        .drop_inode	= generic_delete_inode,
 };
 
-/* Lembram quando eu disse que um hash seria mais eficiente? ;-) */
-static struct file_contents *wbkfs_find_file(struct inode *inode)
+// Operações sobre arquivos
+ssize_t wbkfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
+ssize_t wbkfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos);
+static int wbkfs_open(struct inode *inode, struct file *file);
+const struct file_operations wbkfs_file_operations = {
+	.read		= wbkfs_read,
+	.write		= wbkfs_write,
+	.open		= wbkfs_open,
+};
+static const struct inode_operations wbkfs_file_inode_operations = {
+	.getattr	= simple_getattr,
+};
+
+
+// Operações sobre diretórios
+static int wbkfs_create (struct inode *dir, struct dentry * dentry, umode_t mode, bool excl);
+static int wbkfs_link(struct dentry * old_dentry, struct inode * dir, struct dentry * dentry);
+static int wbkfs_unlink(struct inode * dir, struct dentry *dentry );
+static int wbkfs_symlink(struct inode * dir, struct dentry *dentry, const char * symname);
+static int wbkfs_mkdir(struct inode * dir, struct dentry *dentry, umode_t mode);
+//static int wbkfs_rmdir(struct inode * dir, struct dentry *dentry);
+static const struct inode_operations wbkfs_dir_inode_operations = {
+	.lookup		= simple_lookup,
+	.create		= wbkfs_create,
+	.link		= wbkfs_link,
+	.unlink		= wbkfs_unlink,
+	.symlink	= wbkfs_symlink,
+	.mkdir		= wbkfs_mkdir,
+//	.rmdir		= wbkfs_rmdir,
+};
+
+
+
+
+
+
+
+
+// Efetiva a leitura do arquivo
+ssize_t wbkfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
-	struct file_contents *f;
-
-printk("*** ANDERSON --- FIND FILE ***\n");
-
-	list_for_each_entry(f, &contents_list, list) {
-		if (f->inode == inode)
-			return f;
-	}
-	return NULL;
-}
-
-/* Apos passar pelo VFS, uma leitura chegara aqui. A unica
- * coisa que fazemos eh, achar o ponteiro para o conteudo do arquivo,
- * e retornar, de acordo com o tamanho solicitado */
-ssize_t wbkfs_read(struct file *file, char __user *buf,
-		      size_t count, loff_t *pos)
-{
-	struct file_contents *f;
-printk("*** ANDERSON --- READ (0) ***\n");
 	struct inode *inode = file->f_path.dentry->d_inode;
 	int size = count;
 
-	f = wbkfs_find_file(inode);
-	if (f == NULL)
-		return -EIO;
-		
-	if (f->inode->i_size < count)
-		size = f->inode->i_size;
+	if (inode->i_size < count)
+		size = inode->i_size;
 
-	if ((*pos + size) >= f->inode->i_size)
-		size = f->inode->i_size - *pos;
-	
-	/* As page tables do kernel estao sempre mapeadas (veremos o que
-	 * sao page tables mais pra frente do curso), mas o mesmo nao eh
-	 * verdade com as paginas de espaco de usuario. Dessa forma, uma
-	 * atribuicao de/para um ponteiro contendo um endedereco de espaco
-	 * de usuario pode falhar. Dessa forma, toda a comunicacao
-	 * de/para espaco de usuario eh feita com as funcoes copy_from_user()
-	 * e copy_to_user(). */
-	if (copy_to_user(buf, f->conts + *pos, size))
+	if ((*pos + size) >= inode->i_size)
+		size = inode->i_size - *pos;
+
+	if (copy_to_user(buf, inode->i_private + *pos, size)) {
 		return -EFAULT;
+	}
 	*pos += size;
-	printk("*** ANDERSON --- READ (F) ***\n");
 
 	return size;
 }
 
 
-/*
- * Protótipos das funções.
- */
-static struct inode  *wbkfs_make_inode  (struct super_block *sb, int mode);
-static struct dentry *wbkfs_create_file (struct super_block *sb, struct dentry *dir, const char *name);
-
-
-/* similar a leitura, mas vamos escrever no ponteiro do conteudo.
- * Por simplicidade, estamos escrevendo sempre no comeco do arquivo.
- * Obviamente, esse nao eh o comportamento esperado de um write 'normal'
- * Mas implementacoes de sistemas de arquivos sao flexiveis... */
-ssize_t wbkfs_write(struct file *file, const char __user *buf,
-		       size_t count, loff_t *pos)
+// Localizar o arquivo de backup (que deve estar no mesmo diretório do arquivo original).
+struct inode *wbkfs_find_bkp(struct file *file, const char *name)
 {
-	struct file_contents *f;
+	struct dentry *parent;
+	struct dentry *child;
+	struct list_head *next;
+
+	// Pega o dentry pai do arquivo
+	parent = file->f_path.dentry->d_parent;
+
+	// Pega o primeiro filho da lista
+	next = parent->d_subdirs.next;
+
+	// Para cada dentry filho, verifique se ele tem o nome a ser localizado
+	while (next != &parent->d_subdirs) {
+		child = list_entry(next, struct dentry, d_u.d_child);
+		if (strcmp(child->d_name.name, name)==0) {
+			return child->d_inode;
+		}
+		next = next->next;
+	}
+	return NULL;
+}
+
+
+// Grava o conteúdo de "buf" no respectivo inode, e
+// grava o conteúdo antigo no inode de backup.
+ssize_t wbkfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+{
 	struct inode *inode = file->f_path.dentry->d_inode;
+	struct inode *inode_bkp;
 
-	printk("*** ANDERSON --- WRITE ***\n");
+	size_t ctd_arquivo;
 
-	f = wbkfs_find_file(inode);
-	if (f == NULL)
-		return -ENOENT;
+	const char *name  = file->f_path.dentry->d_name.name;
+	char ext[]        = ".BKP";
+	char name_bkp[80] = ".";
+	char *txt_bkp;
 
+	// Armazena o tamanho do arquivo
+	ctd_arquivo = strlen(inode->i_private);
+	printk("*** ctd_arquivo(%i) - i_size(%lld)***\n", ctd_arquivo, inode->i_size);
 
-	/* ANDERSON */
-	/* Se o nome do arquivo não inicia contém ".BKP", então */
-	unsigned char * name = file->f_path.dentry->d_name.name;
-	char ext[] = ".BKP";
-	if (strstr(name, ext)==NULL) {
-		printk(name);
-		printk(" *** ANDERSON --- WRITE - Diferente (00 - Iniciando novo Backup) ***\n");
+	// Realiza backup apenas se arquivo não tem a extensão ".BKP"
+	if (strstr(name, ext) == NULL) {
 
-		/* Busca o conteúdo original do arquivo */
-		
-		/****
-		char __user *buf_bkp;
-		size_t count_bkp = count;
-		loff_t *pos_bkp = pos;
-		printk(" *** ANDERSON --- WRITE - (01) ***\n");
-		wbkfs_read(file, buf_bkp, count_bkp, pos_bkp);
-		printk(" *** ANDERSON --- WRITE - (02) ***\n");
-		if (buf_bkp != NULL) {
-			printk(buf_bkp);
-			printk(" *** ANDERSON --- WRITE - (03a - Obtendo valor original) ***\n");
-		} else {
-			printk(" *** ANDERSON --- WRITE - (03b - Buffer BKP vazio) ***\n");
+		// Monta o nome do arquivo de Backup
+		strcat(name_bkp, name);
+		strcat(name_bkp, ext);
+
+		// Tenta localizar o arquivo de backup
+		inode_bkp = wbkfs_find_bkp(file, name_bkp);
+
+		// Se ele não existe, então
+		if (!inode_bkp) {
+			// Cria o arquivo de backup
+			inode_bkp = wbkfs_create_backup(inode->i_sb, file->f_path.dentry->d_parent, name_bkp);
+			if (!inode_bkp){
+				return -ENOENT;
+			}
 		}
-		****/
+
+		// Limpa o conteúdo do inode (antes de gravar o novo texto)
+		txt_bkp = inode_bkp->i_private;
+		memset(txt_bkp, 0, strlen(txt_bkp));
+
+		// Copia o conteúdo do inode para o backup
+		strncpy(txt_bkp, inode->i_private, ctd_arquivo);
+
+		printk("***01 inode----->i_private=(%s) ***\n", (char*)inode->i_private);
+		printk("***02 inode_bkp->i_private=(%s) ***\n", (char*)inode_bkp->i_private);
 		
-		/*****
-		char __user *buf_bkp;
-		int size = count;
-		printk(" *** ANDERSON --- WRITE - (01) ***\n");
-		if (f->inode->i_size < count)
-			size = f->inode->i_size;
-		printk(" *** ANDERSON --- WRITE - (02) ***\n");
-		if ((*pos + size) >= f->inode->i_size)
-			size = f->inode->i_size - *pos;
-		printk(" *** ANDERSON --- WRITE - (03) ***\n");
-		if (copy_to_user(buf_bkp, f->conts + *pos, size))
-			return -EFAULT;
-		printk(" *** ANDERSON --- WRITE - (04) ***\n");
-		if (buf_bkp != NULL) {
-			printk(buf_bkp);
-			printk(" *** ANDERSON --- WRITE - (05a - Obtendo valor original) ***\n");
-		} else {
-			printk(" *** ANDERSON --- WRITE - (05b - Buffer BKP vazio) ***\n");
-		}
-		******/
-		
-		/* Cria um novo arquivo (Terminando com ".BKP" */
-		char novo[80] = "";
-		strcat(novo, name);
-		strcat(novo, ext);
-		printk(novo);
-		
-		printk(" *** ANDERSON --- WRITE - (Novo arquivo) ***\n");
-		
-		// Criar um novo arquivo (dentry/inode - com o novo nome)
-		wbkfs_create_file(inode->i_sb, inode->i_sb->s_root, novo);
-		printk(" *** ANDERSON --- WRITE - (Arquivo criado) ***\n");
-		
-		/* Grava o conteúdo desse arquivo */
-		/*
-		 * 
-		 */
-		
-	} else {
-		printk(name);
-		printk(" *** ANDERSON --- WRITE - Igual (NAO feito novo Backup) ***\n");
+		// Armazena o tamanho do texto no inode de backup
+		inode_bkp->i_size = strlen(inode_bkp->i_private);
+		printk("*** Backup-ISIZE (%lld) ***\n", inode_bkp->i_size);
 	}
 
+	// Limpa o conteúdo do inode (antes de gravar o novo texto)
+	memset(inode->i_private, 0, ctd_arquivo);
 
-	/* copy_from_user() : veja comentario na funcao de leitura */
-	if (copy_from_user(f->conts + *pos, buf, count))
+	// Realiza o procedimento normal (Gravar no arquivo original)
+	if (copy_from_user(inode->i_private + *pos, buf, count)) {
 		return -EFAULT;
+	}
+	printk("***GRAVADO=(%s) ***\n", (char*)inode->i_private);
 
+	// Grava o tamanho atual do arquivo
 	inode->i_size = count;
+	printk("***i_SIZE=(%lld) - count(%i) ***\n", inode->i_size, count);
 
 	return count;
 }
 
+
+// Abre um arquivo
 static int wbkfs_open(struct inode *inode, struct file *file)
 {
-	/* Todo arquivo tem uma estrutura privada associada a ele.
-	 * Em geral, estamos apenas copiando a do inode, se houver. Mas isso
-	 * eh tao flexivel quanto se queira, e podemos armazenar aqui
-	 * qualquer tipo de coisa que seja por-arquivo. Por exemplo: Poderiamos
-	 * associar um arquivo /mydir/4321 com o processo no 4321 e guardar aqui
-	 * a estrutura que descreve este processo */
-
-printk("*** ANDERSON --- OPEN ***\n");
-
-	if (inode->i_private)
+	if (inode->i_private) {
 		file->private_data = inode->i_private;
+	}
 	return 0;
 }
 
 
-const struct file_operations wbkfs_file_operations = {
-	.read  = wbkfs_read,
-	.write = wbkfs_write,
-	.open  = wbkfs_open,
-};
-
-static const struct inode_operations wbkfs_file_inode_operations = {
-	.getattr        = simple_getattr,
-};
-
-
-/*
- * Anytime we make a file or directory in our filesystem we need to
- * come up with an inode to represent it internally.  This is
- * the function that does that job.  All that's really interesting
- * is the "mode" parameter, which says whether this is a directory
- * or file, and gives the permissions. (Adaptado de LWNFS).
- */
-static struct inode *wbkfs_make_inode(struct super_block *sb, int mode)
-{
-	struct inode *inode = new_inode(sb);
-
-	if (inode) {
-		inode->i_mode   = mode | S_IFREG;
-		inode->i_uid    = current->cred->fsuid;
-		inode->i_gid    = current->cred->fsgid;
-		inode->i_blocks = 0;
-		inode->i_atime  = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-		inode->i_ino    = ++inode_number;
-		inode->i_op     = &wbkfs_file_inode_operations;
-		inode->i_fop    = &wbkfs_file_operations;
-	}
-	return inode;
-}
-
-
-/* criacao de um arquivo: sem misterio, sem segredo, apenas
- * alocar as estruturas, preencher, e retornar */
-static int wbkfs_create (struct inode *dir, struct dentry * dentry,
-			    umode_t mode, bool excl)
+// Cria de um arquivo (Chamado pelo sistema)
+static int wbkfs_create (struct inode *dir, struct dentry * dentry, umode_t mode, bool excl)
 {
 	struct inode *inode;
-	struct file_contents *file = kmalloc(sizeof(*file), GFP_KERNEL);	
-	struct page *page;
 
-	printk("*** ANDERSON --- CREATE ***\n");
-	unsigned char * name = dentry->d_name.name;
-	printk(name);
-	printk("*** ANDERSON --- Fim printk dentry name.\n");
+	mode |= S_IFREG;
 
-	if (!file)
-		return -EAGAIN;
-
-	/* Cria um novo inode */
+	// Cria um novo inode
 	inode = wbkfs_make_inode(dir->i_sb, mode);
-	
-	/********************************
-	inode = new_inode(dir->i_sb);
-	inode->i_mode = mode | S_IFREG;
-	inode->i_uid = current->cred->fsuid;
-	inode->i_gid = current->cred->fsgid;
-	inode->i_blocks = 0;
-	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-        inode->i_ino = ++inode_number;
-	inode->i_op  = &wbkfs_file_inode_operations;
-	inode->i_fop = &wbkfs_file_operations;
-	********************************/
+	if (!inode) {
+		goto ret_erro;
+	}
 
-	file->inode = inode;
-	page = alloc_page(GFP_KERNEL);
-	if (!page)
-		goto cleanup;
-
-	file->conts = page_address(page);
-	INIT_LIST_HEAD(&file->list);
-	list_add_tail(&file->list, &contents_list); 
-	d_instantiate(dentry, inode);  
+	// Associa o dentry com o inode
+	d_instantiate(dentry, inode);
 	dget(dentry);
 
 	return 0;
-cleanup:
-	iput(inode);
-	kfree(file);
-	return -EINVAL;
+
+ret_erro:
+	return -ENOSPC;
 }
 
 
-/*
- * Create a file mapping a name to a counter (Adaptado de LWNFS).
- */
-static struct dentry *wbkfs_create_file (struct super_block *sb,
-		struct dentry *dir, const char *name)
+// Criação do arquivo de backup
+static struct inode *wbkfs_create_backup(struct super_block *sb, struct dentry *dir, const char *name)
 {
+	struct qstr    qname;
 	struct dentry *dentry;
 	struct inode  *inode;
-	struct qstr   qname;
-	/*
-	 * Make a hashed version of the name to go with the dentry.
-	 */
+
+	// Make a hashed version of the name to go with the dentry.
 	qname.name = name;
 	qname.len  = strlen (name);
 	qname.hash = full_name_hash(name, qname.len);
-	
-	printk("*** ANDERSON --- CREATE_FILE ***\n");
-	printk(name);
-	printk(" *** ANDERSON --- qname.name.\n");
 
-	/*
-	 * Now we can create our dentry and the inode to go with it.
-	 */
+	// Now we can create our dentry and the inode to go with it.
 	dentry = d_alloc(dir, &qname);
-	if (! dentry)
-		goto out;
-	/*
-	 * Cria o inode
-	 */	
-	///wbkfs_create(dir, dentry, 0644, false);
-	inode = wbkfs_make_inode(sb, 0644); //S_IFREG | 
-	if (! inode)
-		goto out_dput;
-	inode->i_fop     = &wbkfs_ops;
-	inode->i_private = 0;
-	/*
-	 * Put it all into the dentry cache and we're done.
-	 */
+	if (! dentry){
+		goto out_dentry;
+	}
+
+	// Cria o inode
+	inode = wbkfs_make_inode(sb, 0644 | S_IFREG);
+	if (!inode){
+		goto out_inode;
+	}
+
+	// Associa o dentry com o inode
 	d_add(dentry, inode);
-	return dentry;
-/*
- * Then again, maybe it didn't work.
- */
-  out_dput:
+
+	return inode;
+
+// Then again, maybe it didn't work.
+out_inode:
 	dput(dentry);
-  out:
-	return 0;
+out_dentry:
+	return NULL;
 }
 
 
+static int wbkfs_link(struct dentry * old_dentry, struct inode * dir, struct dentry * dentry) {
+
+    struct inode * inode = old_dentry->d_inode;
+
+    inode->i_ctime = CURRENT_TIME;
+    inode_inc_link_count(inode);
+    atomic_inc(&inode->i_count);
+
+    d_instantiate(dentry,inode);
+    dget(dentry);
+
+    return 0;
+}
 
 
-static const struct inode_operations wbkfs_dir_inode_operations = {
-        .create         = wbkfs_create,
-	.lookup		= simple_lookup,
-};
+static int wbkfs_unlink(struct inode * dir, struct dentry *dentry ) {
+
+    struct inode * inode = dentry->d_inode;
+    free_pages((unsigned long)(inode->i_private), get_order(inode->i_size));
+
+    inode->i_ctime = dir->i_ctime;
+    inode_dec_link_count(inode);
+
+    return 0;			
+}
+
+
+static int wbkfs_symlink(struct inode * dir, struct dentry *dentry, const char * symname) {
+
+    struct inode * inode;
+    int error = - ENOSPC;
+
+    inode = wbkfs_make_inode(dir->i_sb, S_IFLNK | S_IRWXUGO);
+
+    if (inode) {
+        int l = strlen(symname)+1;
+        error = page_symlink(inode, symname, l);
+        if (!error) {
+            if (dir->i_mode & S_ISGID)
+                inode->i_gid = dir->i_gid;
+            d_instantiate(dentry, inode);
+            dget(dentry);
+            dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+        }
+        else 
+            iput(inode);
+    }
+    return error;
+}
+
+
+static int wbkfs_mkdir(struct inode * dir, struct dentry *dentry, umode_t mode) {
+
+    struct inode * inode;
+
+    mode |= S_IFDIR;
+
+    inode = wbkfs_make_inode(dir->i_sb, mode);
+
+    if (inode) {
+        if (dir->i_mode & S_ISGID) {
+            inode->i_gid = dir->i_gid;
+            if (S_ISDIR(mode))
+                inode->i_mode |= S_ISGID;
+        }
+
+        d_instantiate(dentry, inode);
+        dget(dentry);
+        dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+        inode->i_ino = ++inode_number;
+        inc_nlink(dir);
+
+        return 0;
+    }
+    return -ENOMEM;
+}
+
+//static int wbkfs_rmdir(struct inode * dir, struct dentry *dentry) {
+//    printk("*** Tentando remover o Diretório (%s)", dentry->d_name.name);
+//    return 0;
+//}
+
+// Cria um novo inode.
+static struct inode *wbkfs_make_inode(struct super_block *sb, int mode)
+{
+	struct inode *inode;
+	struct page  *page;
+
+	// Cria um novo inode
+	inode = new_inode(sb);
+
+	if (inode) {
+		inode->i_ino     = ++inode_number;
+		inode->i_uid     = current->cred->fsuid;
+		inode->i_gid     = current->cred->fsgid;
+		inode->i_size    = 0;
+		inode->i_atime   = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+		inode->i_blocks  = 0;
+		inode->i_bytes   = 0;
+		inode->i_mode    = mode;
+		inode->i_sb      = sb;
+		switch (mode & S_IFMT) {
+			case S_IFREG:
+				// Aloca uma nova página para o conteúdo do arquivo
+				page = alloc_page(GFP_KERNEL);
+				if (!page) {
+					iput(inode);
+					return NULL;
+				} else {
+					memset(page, 0, sizeof(page));
+				}
+				inode->i_private = page_address(page);
+				inode->i_op  = &wbkfs_file_inode_operations;
+				inode->i_fop = &wbkfs_file_operations;
+				break;
+			case S_IFDIR:
+				inode->i_op  = &wbkfs_dir_inode_operations;
+				inode->i_fop = &simple_dir_operations;
+				/* directory inodes start off with i_nlink == 2 (for "." entry) */
+				inc_nlink(inode);
+				break;
+		}
+	}
+	return inode;
+}
 
 
 static int wbkfs_fill_super(struct super_block *sb, void *data, int silent)
@@ -367,28 +397,26 @@ static int wbkfs_fill_super(struct super_block *sb, void *data, int silent)
         struct inode * inode;
         struct dentry * root;
 
-printk("*** ANDERSON --- FILL SUPER ***\n");
-
-        sb->s_maxbytes = 4096;
-        sb->s_magic = 0xBEBACAFE;
-	sb->s_blocksize = 1024;
-	sb->s_blocksize_bits = 10;
-
-        sb->s_op = &wbkfs_ops;
-        sb->s_time_gran = 1;
+        sb->s_maxbytes		= 4096;
+        sb->s_magic		= 0xDE5AF105;
+	sb->s_blocksize		= 1024;
+	sb->s_blocksize_bits	= 10;
+        sb->s_op		= &wbkfs_ops;
+        sb->s_time_gran		= 1;
 
         inode = new_inode(sb);
 
-        if (!inode)
+        if (!inode) {
                 return -ENOMEM;
+	}
 
-        inode->i_ino = ++inode_number;
-        inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
-        inode->i_blocks = 0;
-        inode->i_uid = inode->i_gid = 0;
-        inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR;
-        inode->i_op = &wbkfs_dir_inode_operations;
-        inode->i_fop = &simple_dir_operations;
+        inode->i_ino	= ++inode_number;
+        inode->i_mtime	= inode->i_atime = inode->i_ctime = CURRENT_TIME;
+        inode->i_blocks	= 0;
+        inode->i_uid	= inode->i_gid = 0;
+        inode->i_mode	= S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR;
+        inode->i_op	= &wbkfs_dir_inode_operations;
+        inode->i_fop	= &simple_dir_operations;
         set_nlink(inode, 2);
 
         root = d_make_root(inode);
@@ -398,16 +426,14 @@ printk("*** ANDERSON --- FILL SUPER ***\n");
         }
         sb->s_root = root;
         return 0;
-
 }
 
-static struct dentry *wbkfs_get_sb(struct file_system_type *fs_type, int flags, const char *dev_name,
-		   void *data)
+
+static struct dentry *wbkfs_get_sb(struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
 {
-printk("*** ANDERSON --- GET_SB ***\n");
-
-  return mount_bdev(fs_type, flags, dev_name, data, wbkfs_fill_super);
+	return mount_bdev(fs_type, flags, dev_name, data, wbkfs_fill_super);
 }
+
 
 static struct file_system_type wbkfs_fs_type = {
 	.owner		= THIS_MODULE,
@@ -416,12 +442,18 @@ static struct file_system_type wbkfs_fs_type = {
 	.kill_sb	= kill_litter_super,
 };
 
+
 static int __init init_wbkfs_fs(void)
 {
-printk("*** ANDERSON --- INIT ***\n");
-
-	INIT_LIST_HEAD(&contents_list);
-	return register_filesystem(&wbkfs_fs_type);
+	int err;
+	inode_number = 0;
+	err=register_filesystem(&wbkfs_fs_type);
+	if (!err) {
+		goto out;
+	}
+	printk(KERN_INFO "*** WBKFS: Support added --- Anderson ***\n");
+out:
+	return err;
 }
 
 static void __exit exit_wbkfs_fs(void)
@@ -431,4 +463,6 @@ static void __exit exit_wbkfs_fs(void)
 
 module_init(init_wbkfs_fs)
 module_exit(exit_wbkfs_fs)
+
 MODULE_LICENSE("GPL");
+

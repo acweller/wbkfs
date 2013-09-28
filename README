@@ -1,21 +1,24 @@
-WBKFS
+WBkFS
 =========================
 
 Weller BacKup File System
 
 =========================
 
-Autor: Anderson C. Weller
+Autor: Anderson Coelho Weller
 
-1) Sistema de arquivos com backup integrado (wbkfs)
+1) Sistema de arquivos com backup integrado (WBkFS)
 
+	WBkFS: Sistema de arquivos de brinquedo que realiza backup dos arquivos gravados.
+	
 	Funcionalidade: Realização de backup dos arquivos, antes deles serem efetivamente alterados.
-	Ao gravar algum arquivo, o "wbkfs" armazena o conteúdo original em um arquivo de backup (extensão BKP).
-	(Ex.: Ao salvar o arquivo "anderson.txt" é gerado um outro "anderson.txt.BKP" com o conteúdo anterior do arquivo)
 
-2) Origem do "wbkfs":
+	Ao gravar algum arquivo, o "WBkFS" armazena o conteúdo original em um arquivo oculto de backup (iniciando com ponto [.] e com extensão .BKP). (Ex.: Grava em ".anderson.txt.BKP" o conteúdo que estava em "anderson.txt" antes deste ser alterado).
 
-	- Surgiu a partir de alterações no "islenefs" em conjunto com o "lwnfs".
+
+2) Origem do "WBkFS":
+
+	- Surgiu a partir de alterações no "IsleneFS" em conjunto com o "LwnFS" e o GOGIsleneFS, como parte dos trabalhos realizados na matéria "MO806 - Tópicos em Sistemas Operacionais" do mestrado em computação da Unicamp, no 2º semestre de 2013.
 
 3) Modificações nos diretórios/arquivos de fonte do kernel, para a inclusão do novo sistema de arquivos:
 
@@ -32,7 +35,7 @@ Autor: Anderson C. Weller
 		cp ./fs/Makefile ./fs/Makefile.old
 		echo "obj-y += wbkfs/" >> ./fs/Makefile
 
-3) Compilação do Kernel:
+4) Compilação do Kernel:
 
 	- Continuando no diretório inicial do código fonte do kernel, por exemplo:
 		cd /home/anderson/linux-3.10.6/
@@ -40,12 +43,12 @@ Autor: Anderson C. Weller
 	- Compilar o kernel do linux (Calculando o tempo (time) e gerando arquivos ".deb" para instalação do kernel com o "dpkg -i ...")
 		time fakeroot make-kpkg -j1 --initrd --revision=3.10.6 --append-to-version=wbkfs.01 kernel_image kernel_headers
 
-4) Testar o funcionamento do novo FileSystem
+5) Testar o funcionamento do novo FileSystem
 
 	- Abrir o QEMU com o novo Kernel (Exemplo utilizando a imagem "../mo806.img")
 		qemu-system-i386 -hda ../mo806.img -kernel arch/i386/boot/bzImage -append "ro root=/dev/hda"
 
-	- Criar um novo disco virtual (para utilizar com o wbkfs)
+	- Criar um novo disco virtual (para utilizar com o WBkFS)
 		dd if=/dev/zero of=virtual.dsk bs=1k count=40
 
 	- Montar o disco virtual
@@ -57,7 +60,7 @@ Autor: Anderson C. Weller
 
 	- Realizar os testes:
 		cat > a.txt
-		[... digitar texto ...]
+		[... digitar texto ... Pressionar ENTER ...]
 		[... Pressionar CTRL+D para encerrar o "cat" ...]
 
 	- Verificar o resultado dos testes (digitar os comandos e verificar os resultados):
@@ -72,12 +75,33 @@ Autor: Anderson C. Weller
 	- Fechar o QEMU
 		shutdown -h now
 
-5) Principais Métodos:
+6) Detalhes da implementação:
 
-    static struct file_contents *wbkfs_find_file(struct inode *inode);
-    ssize_t wbkfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
-    ssize_t wbkfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos);
-    static struct inode *wbkfs_make_inode(struct super_block *sb, int mode);
-    static int wbkfs_create (struct inode *dir, struct dentry * dentry, umode_t mode, bool excl);
-    static struct dentry *wbkfs_create_file (struct super_block *sb, struct dentry *dir, const char *name);
+	- inode->i_private - Armazena o conteúdo do arquivo.
+
+	- inode->i_size    - Armazena o número de bytes gravados no arquivo.
+
+7) Principais Métodos:
+
+	// Localizar o arquivo de backup (que deve estar no mesmo diretório do arquivo original).
+	struct inode *wbkfs_find_bkp(struct file *file, const char *name)
+
+	// Grava o conteúdo de "buf" no respectivo inode, e grava o conteúdo antigo no inode de backup.
+	ssize_t wbkfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+
+	// Cria de um arquivo (Chamado pelo sistema)
+	static int wbkfs_create (struct inode *dir, struct dentry * dentry, umode_t mode, bool excl)
+
+	// Criação do arquivo de backup
+	static struct inode *wbkfs_create_backup(struct super_block *sb, struct dentry *dir, const char *name)
+
+	// Cria um novo inode.
+	static struct inode *wbkfs_make_inode(struct super_block *sb, int mode)
+
+
+8) Problemas conhecidos:
+
+	- Por algum motivo o valor de "inode->i_size" aparece zerado no método Write. Por esse motivo, é utilizado o método "strlen" para encontrar esse valor.
+
+	- Em alguns casos, aparecem lixo apos o conteúdo gravado no inode.
 
