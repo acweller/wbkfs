@@ -9,7 +9,7 @@ Autor: Anderson Coelho Weller
 
 1) Sistema de arquivos com backup integrado (WBkFS)
 
-	WBkFS: Sistema de arquivos de brinquedo que realiza backup dos arquivos gravados.
+	WBkFS: Sistema de arquivos de brinquedo, com controle de subdiretórios, que realiza backup dos arquivos gravados.
 	
 	Funcionalidade: Realização de backup dos arquivos, antes deles serem efetivamente alterados.
 
