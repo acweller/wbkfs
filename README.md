@@ -105,4 +105,3 @@ Autor: Anderson Coelho Weller
 
 	- Em alguns casos, aparecem lixo apos o conteúdo gravado no inode.
 
-
